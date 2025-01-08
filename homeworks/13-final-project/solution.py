@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Neural ranking homework solution"""
+"""Final project solution"""
 
 import argparse
 from timeit import default_timer as timer
