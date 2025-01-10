@@ -15,7 +15,7 @@ import gc
 from collections import defaultdict
 
 class VKMarcoIterableDataset(IterableDataset):
-    def __init__(self, data_dir, split='train', tokenizer=None, max_length=256):
+    def __init__(self, data_dir, split='train', tokenizer=None, max_length=512):
         self.data_dir = data_dir
         self.split = split
         self.tokenizer = tokenizer
@@ -262,37 +262,6 @@ def train_model(model, train_loader, val_loader, device, num_epochs=1):
             
         avg_train_loss = total_loss / train_steps
         
-        # Валидация
-        model.eval()
-        val_loss = 0
-        val_steps = 0
-        
-        print("\nStarting validation...")
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc='Validation'):
-                with torch.cuda.amp.autocast():
-                    input_ids = batch['input_ids'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
-                    labels = batch['labels'].to(device)
-                    
-                    outputs = model(input_ids, attention_mask)
-                    loss = criterion(outputs, labels)
-                    val_loss += loss.item()
-                    val_steps += 1
-                
-                del input_ids, attention_mask, labels, outputs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
-        avg_val_loss = val_loss / val_steps
-        
-        print(f'\nEpoch {epoch+1} Results:')
-        print(f'Average Training Loss: {avg_train_loss:.4f}')
-        print(f'Average Validation Loss: {avg_val_loss:.4f}')
-        
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-        
         gc.collect()
     
     return model
@@ -326,12 +295,12 @@ def main():
     
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=512,
+        batch_size=256,
         pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=512,
+        batch_size=256,
         pin_memory=True
     )
     
@@ -341,7 +310,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        num_epochs=1
+        num_epochs=3
     )
     
     submission = create_submission(
