@@ -1,360 +1,234 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Final project solution"""
+"""Neural ranking homework solution"""
 
+import os
 import argparse
 from timeit import default_timer as timer
-import os
+import random
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+import numpy as np
 from transformers import AutoModel, AutoTokenizer
-import pandas as pd
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+import pandas as pd
 import gc
-from collections import defaultdict
 
-class VKMarcoIterableDataset(IterableDataset):
-    def __init__(self, data_dir, split='train', tokenizer=None, max_length=256):
-        self.data_dir = data_dir
-        self.split = split
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        
-        self.docs_file = os.path.join(data_dir, 'vkmarco-docs.tsv')
-        self.queries_file = os.path.join(data_dir, f'vkmarco-doc{split}-queries.tsv')
-        self.qrels_file = os.path.join(data_dir, f'vkmarco-doc{split}-qrels.tsv')
-        
-        self.queries = self._load_queries()
-        self.qrels = self._load_qrels()
-        
-        self.doc_offsets = self._create_doc_index()
-        self.length = sum(len(query_docs) for query_docs in self.qrels.values())
-        
+
+# Define dataset and model classes (from the provided script)
+class VKMarcoDataset(Dataset):
+    def __init__(self, data, doc_path, doc_offsets, neg_sampling=1.0):
+        if neg_sampling < 1.0:
+            high_rel = data[data['Label'] >= 2]
+            medium_rel = data[data['Label'] == 1]
+            low_rel = data[data['Label'] == 0]
+
+            low_rel = low_rel.sample(frac=neg_sampling, random_state=42)
+
+            self.data = pd.concat([high_rel, medium_rel, low_rel])
+        else:
+            self.data = data
+
+        self.doc_path = doc_path
+        self.doc_offsets = doc_offsets
+
     def __len__(self):
-        return self.length
-        
-    def _load_queries(self):
-        queries = {}
-        with open(self.queries_file, 'r') as f:
-            for line in f:
-                query_id, query_text = line.strip().split('\t')
-                queries[query_id] = query_text
-        return queries
-        
-    def _load_qrels(self):
-        qrels = defaultdict(list)
-        with open(self.qrels_file, 'r') as f:
-            for line in f:
-                query_id, _, doc_id, relevance = line.strip().split(' ')
-                qrels[query_id].append((doc_id, float(relevance)))
-        return qrels
-        
-    def _create_doc_index(self):
-        offsets = {}
-        with open(self.docs_file, 'r') as f:
-            offset = 0
-            for line in f:
-                doc_id = line.split('\t')[0]
-                offsets[doc_id] = offset
-                offset += len(line.encode('utf-8'))
-        return offsets
-        
-    def _get_doc_by_id(self, doc_id):
-        with open(self.docs_file, 'r') as f:
-            f.seek(self.doc_offsets[doc_id])
-            line = f.readline()
-            _, _, title, body = line.strip().split('\t')
-            return title, body
-            
-    def __iter__(self):
-        for query_id, query_docs in self.qrels.items():
-            query_text = self.queries[query_id]
-            
-            for doc_id, relevance in query_docs:
-                title, body = self._get_doc_by_id(doc_id)
-                doc_text = f"{title} [SEP] {body}"
-                
-                encoded = self.tokenizer.encode_plus(
-                    query_text,
-                    doc_text,
-                    add_special_tokens=True,
-                    max_length=self.max_length,
-                    padding='max_length',
-                    truncation=True,
-                    return_tensors='pt'
-                )
-                
-                yield {
-                    'input_ids': encoded['input_ids'].squeeze(0),
-                    'attention_mask': encoded['attention_mask'].squeeze(0),
-                    'labels': torch.tensor(relevance / 3.0, dtype=torch.float32)
-                }
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        query_text, doc_id, label = self.data.iloc[idx, [1, 2, 3]]
+        doc = self.extract_line(int(doc_id[1:]))
+        doc_text = f"{doc[2]} {doc[3]}"
+        return (query_text.lower(), doc_text.lower()), label / 3.0
+
+    def extract_line(self, index):
+        with open(self.doc_path, 'rb') as file:
+            file.seek(self.doc_offsets[index - 1])
+            line = file.readline().decode('utf-8').strip()
+        return line.split('\t')
+
 
 class RankingModel(nn.Module):
-    def __init__(self, model_name='microsoft/mdeberta-v3-base'):
+    def __init__(self, model_name='xlm-roberta-base', layers_to_unfreeze=2):
         super(RankingModel, self).__init__()
-        
+
         self.transformer = AutoModel.from_pretrained(model_name)
         hidden_size = self.transformer.config.hidden_size
-        
-        self.ranking_head = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 1)
-        )
-        
-        for param in self.transformer.parameters():
-            param.requires_grad = False
-            
-        for param in self.transformer.encoder.layer[-1].attention.parameters():
-            param.requires_grad = True
 
-    def forward(self, input_ids, attention_mask):
-        outputs = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=False,
-            return_dict=False
-        )
-        
-        cls_output = outputs[0][:, 0]
-        return self.ranking_head(cls_output).squeeze(-1)
+        self.head = nn.Linear(hidden_size, 1)
 
-def create_submission(model, tokenizer, data_dir, device, batch_size=128):
-    model.eval()
-    
-    sample_submission = pd.read_csv(os.path.join(data_dir, 'sample_submission.csv'))
-    eval_queries = pd.read_csv(
-        os.path.join(data_dir, 'vkmarco-doceval-queries.tsv'),
-        sep='\t',
-        names=['QueryId', 'QueryText']
-    )
-    
-    queries_dict = dict(zip(eval_queries.QueryId, eval_queries.QueryText))
-    
-    docs_cache = {}
-    doc_offsets = {}
-    
-    with open(os.path.join(data_dir, 'vkmarco-docs.tsv'), 'r') as f:
-        offset = 0
-        for line in f:
-            doc_id = line.split('\t')[0]
-            doc_offsets[doc_id] = offset
-            offset += len(line.encode('utf-8'))
-    
-    def get_doc_text(doc_id):
-        if doc_id not in docs_cache:
-            with open(os.path.join(data_dir, 'vkmarco-docs.tsv'), 'r') as f:
-                f.seek(doc_offsets[doc_id])
-                line = f.readline()
-                _, _, title, body = line.strip().split('\t')
-                docs_cache[doc_id] = f"{title} [SEP] {body}"
-        return docs_cache[doc_id]
-    
-    results_dict = {}
-    
-    with torch.inference_mode():
-        for query_id in tqdm(sample_submission['QueryId'].unique()):
-            query_text = queries_dict[query_id]
-            current_docs = sample_submission[sample_submission['QueryId'] == query_id]['DocumentId'].tolist()
-            all_scores = []
-            
-            for i in range(0, len(current_docs), batch_size):
-                batch_docs = current_docs[i:i + batch_size]
-                batch_tensors = []
-                
-                for doc_id in batch_docs:
-                    doc_text = get_doc_text(doc_id)
-                    
-                    encoded = tokenizer(
-                        query_text,
-                        doc_text,
-                        add_special_tokens=True,
-                        max_length=512,
-                        padding='max_length',
-                        truncation=True,
-                        return_tensors='pt'
-                    )
-                    
-                    batch_tensors.append({
-                        'input_ids': encoded['input_ids'],
-                        'attention_mask': encoded['attention_mask']
-                    })
-                
-                batch_input_ids = torch.cat([x['input_ids'] for x in batch_tensors]).to(device)
-                batch_attention_mask = torch.cat([x['attention_mask'] for x in batch_tensors]).to(device)
-                
-                with torch.cuda.amp.autocast():
-                    scores = model(batch_input_ids, batch_attention_mask)
-                    scores = torch.sigmoid(scores)
-                    scores = scores.cpu().numpy()
-                
-                all_scores.extend(list(zip(batch_docs, scores)))
-                
-                del batch_input_ids, batch_attention_mask
-                torch.cuda.empty_cache()
-            
-            sorted_pairs = sorted(all_scores, key=lambda x: float(x[1]), reverse=True)
-            results_dict[query_id] = [doc_id for doc_id, _ in sorted_pairs]
-    
-    new_rows = []
-    for _, row in sample_submission.iterrows():
-        query_id = row['QueryId']
-        doc_id = results_dict[query_id].pop(0)
-        new_rows.append({'QueryId': query_id, 'DocumentId': doc_id})
-    
-    submission = pd.DataFrame(new_rows)
-    return submission
+        for name, par in self.transformer.named_parameters():
+            if 'bias' in name or 'LayerNorm' in name:
+                continue
+            par.requires_grad = False
 
-def train_model(model, train_loader, val_loader, device, num_epochs=1):
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=1e-4,
-        weight_decay=0.01
-    )
-    
-    criterion = nn.MSELoss()
-    model = model.to(device)
-    scaler = torch.cuda.amp.GradScaler()
-    best_val_loss = float('inf')
-    
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0
-        train_steps = 0
-        
-        progress_bar = tqdm(
-            enumerate(train_loader), 
-            desc=f'Epoch {epoch + 1}/{num_epochs}',
-            total=train_loader.dataset.length // train_loader.batch_size
-        )
-        
-        for step, batch in progress_bar:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            
-            optimizer.zero_grad()
-            
-            with torch.cuda.amp.autocast():
-                outputs = model(input_ids, attention_mask)
-                loss = criterion(outputs, labels)
-            
-            scaler.scale(loss).backward()
-            
-            for param in model.transformer.parameters():
-                if not param.requires_grad:
-                    param.grad = None
-            
-            scaler.step(optimizer)
-            scaler.update()
-            
-            total_loss += loss.item()
-            train_steps += 1
-            
-            if step % 10 == 0:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            del input_ids, attention_mask, labels, outputs
-            
-        avg_train_loss = total_loss / train_steps
-        
-        # Валидация
-        model.eval()
-        val_loss = 0
-        val_steps = 0
-        
-        print("\nStarting validation...")
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc='Validation'):
-                with torch.cuda.amp.autocast():
-                    input_ids = batch['input_ids'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
-                    labels = batch['labels'].to(device)
-                    
-                    outputs = model(input_ids, attention_mask)
-                    loss = criterion(outputs, labels)
-                    val_loss += loss.item()
-                    val_steps += 1
-                
-                del input_ids, attention_mask, labels, outputs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
-        avg_val_loss = val_loss / val_steps
-        
-        print(f'\nEpoch {epoch+1} Results:')
-        print(f'Average Training Loss: {avg_train_loss:.4f}')
-        print(f'Average Validation Loss: {avg_val_loss:.4f}')
-        
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-        
-        gc.collect()
-    
-    return model
+        layer_count = self.transformer.config.num_hidden_layers
+        for i in range(layers_to_unfreeze):
+            for par in self.transformer.encoder.layer[layer_count - 1 - i].parameters():
+                par.requires_grad = True
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None):
+        x = self.transformer(input_ids=input_ids,
+                             token_type_ids=token_type_ids,
+                             attention_mask=attention_mask
+                             )[0][:, 0, :]
+        x = self.head(x).squeeze(-1)
+        return x
+
+
+# Utility functions
+def compose_batch(batch):
+    texts = [x for x, _ in batch]
+    ys = torch.tensor([y for _, y in batch]).float()
+    tokens = tokenizer(texts, padding=True, truncation=True, max_length=64, return_tensors='pt')
+    return tokens, ys
+
+
+def move_batch_to_device(batch, device):
+    batch_x, y = batch
+    for key in batch_x:
+        batch_x[key] = batch_x[key].to(device)
+    y = y.to(device)
+    return batch_x, y
+
 
 def main():
+    # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Neural ranking homework solution')
     parser.add_argument('--submission_file', required=True, help='output Kaggle submission file')
     parser.add_argument('data_dir', help='input data directory')
     args = parser.parse_args()
 
+    # Measure script execution time
     start = timer()
 
+    # Set random seed for reproducibility
+    random.seed(42)
+    np.random.seed(42)
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    TRAIN_QUERIES_PATH = os.path.join(args.data_dir, "vkmarco-doctrain-queries.tsv")
+    TRAIN_QRELS_PATH = os.path.join(args.data_dir, "vkmarco-doctrain-qrels.tsv")
+    VAL_QUERIES_PATH = os.path.join(args.data_dir, "vkmarco-docdev-queries.tsv")
+    VAL_QRELS_PATH = os.path.join(args.data_dir, "vkmarco-docdev-qrels.tsv")
+    TEST_QUERIES_PATH = os.path.join(args.data_dir, "/vkmarco-doceval-queries.tsv")
+    DOCS_PATH = os.path.join(args.data_dir, "vkmarco-docs.tsv")
+
+    # Load and preprocess data
+    df_queries_train = pd.read_csv(TRAIN_QUERIES_PATH, sep='\t', header=None, names=['QueryId', 'Query'])
+    df_queries_val = pd.read_csv(VAL_QUERIES_PATH, sep='\t', header=None, names=['QueryId', 'Query'])
+    df_queries_test = pd.read_csv(TEST_QUERIES_PATH, sep='\t', header=None, names=['QueryId', 'Query'])
+    df_qrels_train = pd.read_csv(TRAIN_QRELS_PATH, sep=' ', header=None,
+                                 names=['QueryId', 'unused', 'DocumentId', 'Label'])
+    df_qrels_val = pd.read_csv(VAL_QRELS_PATH, sep=' ', header=None, names=['QueryId', 'unused', 'DocumentId', 'Label'])
+
+    train_data = pd.merge(df_queries_train, df_qrels_train, how="right", on="QueryId").drop(columns="unused")
+    val_data = pd.merge(df_queries_val, df_qrels_val, how="right", on="QueryId").drop(columns="unused")
+
+    doc_offsets = []
+    with open(DOCS_PATH, 'rb') as file:
+        position = 0
+        for line in file:
+            doc_offsets.append(position)
+            position = file.tell()
+
+    dataset_train = VKMarcoDataset(train_data, DOCS_PATH, doc_offsets, neg_sampling=0.3)
+    dataset_valid = VKMarcoDataset(val_data, DOCS_PATH, doc_offsets)
+    train_loader = DataLoader(dataset_train, shuffle=True, batch_size=256, collate_fn=compose_batch)
+    val_loader = DataLoader(dataset_valid, shuffle=False, batch_size=256, collate_fn=compose_batch)
+
+    global tokenizer
     tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
     model = RankingModel('xlm-roberta-base')
-    
-    print("Creating datasets...")
-    train_dataset = VKMarcoIterableDataset(
-        data_dir=args.data_dir,
-        split='train',
-        tokenizer=tokenizer
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    scaler = torch.cuda.amp.GradScaler()
+
+    num_epochs = 3
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        train_steps = 0
+
+        progress_bar = tqdm(
+            enumerate(train_loader),
+            desc=f'Epoch {epoch + 1}/{num_epochs}',
+            total=len(train_loader.dataset) // train_loader.batch_size,
+            unit=' batch',
+            bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}'
+        )
+
+        for step, batch in progress_bar:
+            tokenized, labels = move_batch_to_device(batch, device)
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                outputs = model(**tokenized)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+
+            for param in model.transformer.parameters():
+                if not param.requires_grad:
+                    param.grad = None
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss += loss.item()
+            train_steps += 1
+
+            progress_bar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{total_loss / train_steps:.4f}',
+                'batch': f'{step + 1}'
+            })
+
+            if step % 100 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+        avg_train_loss = total_loss / train_steps
+
+        print(f'\nEpoch {epoch + 1} Results:')
+        print(f'Average Training Loss: {avg_train_loss:.4f}')
+
+    sample_submission_path = os.path.join(args.data_dir, 'sample_submission.csv')
+    sample_submission = pd.read_csv(sample_submission_path)
+    sample_submission['Label'] = 0
+
+    test_data = pd.merge(df_queries_test, sample_submission, how="right", on="QueryId")
+    dataset_test = VKMarcoDataset(test_data, DOCS_PATH, doc_offsets)
+    test_loader = DataLoader(dataset_test, shuffle=False, batch_size=512, collate_fn=compose_batch)
+
+    model.eval()
+
+    y_test = []
+    progress_bar = tqdm(
+        enumerate(test_loader),
+        total=len(test_loader.dataset) // test_loader.batch_size,
+        unit='batch',
+        bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}'
     )
-    val_dataset = VKMarcoIterableDataset(
-        data_dir=args.data_dir,
-        split='dev',
-        tokenizer=tokenizer
-    )
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=512,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=512,
-        pin_memory=True
-    )
-    
-    print("Starting training...")
-    model = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        num_epochs=1
-    )
-    
-    submission = create_submission(
-        model=model,
-        tokenizer=tokenizer,
-        data_dir=args.data_dir,
-        device=device
-    )
-    
-    submission.to_csv(args.submission_file, index=False)
+
+    for i, batch in progress_bar:
+        tokenized, _ = move_batch_to_device(batch, device)
+        with torch.no_grad():
+            preds = model(**tokenized)
+            y_test.extend(preds)
+
+    numpy_array = torch.stack(y_test).cpu().tolist()
+    test_data['pred'] = numpy_array
+    result_df = test_data.sort_values(by=['QueryId', 'pred'], ascending=[True, False])
+
+    result_df[['QueryId', 'DocumentId']].to_csv('submission.csv', index=False)
 
     elapsed = timer() - start
-    print(f"finished, elapsed = {elapsed:.3f}")
+    print(f"finished, elapsed = {elapsed:.3f}s")
+
 
 if __name__ == "__main__":
     main()
